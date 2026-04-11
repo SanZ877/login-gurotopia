@@ -3,11 +3,73 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import path from 'path';
 import fs from 'fs';
+import { SQL } from 'bun';
 
 const app = express();
 const PORT = 3000;
 
-// @note trust proxy - set to number of proxies in front of app
+const MAX_ATTEMPTS = 5;
+const COOLDOWN_MS = 30 * 60 * 1000;
+
+const dbUrl = process.env.DATABASE_URL || 'mysql://root:password@localhost:3306/growtopia';
+const db = new SQL(dbUrl);
+
+const ipAttempts = new Map<string, { count: number; blockedUntil: number }>();
+
+function getClientIp(req: Request): string {
+  const xff = req.headers['x-forwarded-for'];
+  const xri = req.headers['x-real-ip'];
+  const forwarded = Array.isArray(xff) ? xff[0] : xff;
+  const realIp = Array.isArray(xri) ? xri[0] : xri;
+  return (
+    (forwarded as string)?.split(',')[0]?.trim() ||
+    (realIp as string) ||
+    req.socket.remoteAddress ||
+    'unknown'
+  );
+}
+
+function checkIpBlocked(clientIp: string): { blocked: boolean; remaining: number } {
+  const record = ipAttempts.get(clientIp);
+  if (!record) return { blocked: false, remaining: MAX_ATTEMPTS };
+
+  const now = Date.now();
+  if (record.blockedUntil > now) {
+    return { blocked: true, remaining: 0 };
+  }
+
+  if (record.blockedUntil > 0 && record.blockedUntil <= now) {
+    ipAttempts.delete(clientIp);
+    return { blocked: false, remaining: MAX_ATTEMPTS };
+  }
+
+  return { blocked: false, remaining: MAX_ATTEMPTS - record.count };
+}
+
+function recordFailedAttempt(clientIp: string): number {
+  const record = ipAttempts.get(clientIp) || { count: 0, blockedUntil: 0 };
+  const now = Date.now();
+
+  if (record.blockedUntil > now) {
+    return 0;
+  }
+
+  record.count += 1;
+  const remaining = MAX_ATTEMPTS - record.count;
+
+  if (record.count >= MAX_ATTEMPTS) {
+    record.blockedUntil = now + COOLDOWN_MS;
+    console.log(`[BLOCKED] IP ${clientIp} blocked for 30 minutes`);
+  }
+
+  ipAttempts.set(clientIp, record);
+  return Math.max(0, remaining);
+}
+
+function resetAttempts(clientIp: string): void {
+  ipAttempts.delete(clientIp);
+}
+
 app.set('trust proxy', 1);
 
 // @note middleware setup
@@ -28,14 +90,8 @@ app.use(limiter);
 // @note static files from public folder
 app.use(express.static(path.join(process.cwd(), 'public')));
 
-// @note request logging middleware
 app.use((req: Request, _res: Response, next: NextFunction) => {
-  const clientIp =
-    (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
-    req.headers['x-real-ip'] ||
-    req.socket.remoteAddress ||
-    'unknown';
-
+  const clientIp = getClientIp(req);
   console.log(
     `[REQ] ${req.method} ${req.path} → ${clientIp} | ${_res.statusCode}`,
   );
@@ -75,31 +131,91 @@ app.all('/player/login/dashboard', async (req: Request, res: Response) => {
   res.send(htmlContent);
 });
 
+
+
 /**
- * @note validate login endpoint - validates GrowID credentials
+ * @note validate login endpoint - validates GrowID credentials from MySQL
  * @param req - express request with growId, password, _token
  * @param res - express response with token
  */
 app.all(
   '/player/growid/login/validate',
   async (req: Request, res: Response) => {
+    const clientIp = getClientIp(req);
+
+    const { blocked, remaining } = checkIpBlocked(clientIp);
+    if (blocked) {
+      // generate error HTML directly
+      const clientData = '';
+      const errorMessage = 'Login attempts exhausted from your IP, Please try again later after 30 mins';
+      const templatePath = path.join(process.cwd(), 'template', 'dashboard.html');
+      const templateContent = fs.readFileSync(templatePath, 'utf-8');
+      const errorHtml = `<div class="text-danger text-danger-wrapper"><ul><li>${errorMessage}</li></ul></div>`;
+      let htmlContent = templateContent.replace('{{ data }}', Buffer.from(clientData).toString('base64'));
+      htmlContent = htmlContent.replace('<div class="row div-content-center">', `${errorHtml}<div class="row div-content-center">`);
+      res.setHeader('Content-Type', 'text/html');
+      res.send(htmlContent);
+      return;
+    }
+
     try {
       const formData = req.body as Record<string, string>;
+      const email = formData.email;
+
+      if (email) {
+        return;
+      }
+
       const _token = formData._token;
       const growId = formData.growId;
       const password = formData.password;
-      const email = formData.email;
 
-      let token = '';
-      if (email) {
-        token = Buffer.from(
-          `_token=${_token}&growId=${growId}&password=${password}&email=${email}&reg=1`,
-        ).toString('base64');
-      } else {
-        token = Buffer.from(
-          `_token=${_token}&growId=${growId}&password=${password}&reg=0`,
-        ).toString('base64');
+      if (!growId || !password) {
+        res.status(200).json({
+          status: 'error',
+          message: 'Missing growId or password',
+        });
+        return;
       }
+
+      const rows = await db`SELECT * FROM peer WHERE growid = ${growId} LIMIT 1`;
+
+      if (rows.length === 0) {
+        const attemptsLeft = recordFailedAttempt(clientIp);
+        // generate error HTML directly
+        const clientData = btoa(`${growId}`);
+        const errorMessage = `Account credentials missmatched. You have ${attemptsLeft} attempt(s) left.`;
+        const templatePath = path.join(process.cwd(), 'template', 'dashboard.html');
+        const templateContent = fs.readFileSync(templatePath, 'utf-8');
+        const errorHtml = `<div class="text-danger text-danger-wrapper"><ul><li>${errorMessage}</li></ul></div>`;
+        let htmlContent = templateContent.replace('{{ data }}', Buffer.from(clientData).toString('base64'));
+        htmlContent = htmlContent.replace('<div class="row div-content-center">', `${errorHtml}<div class="row div-content-center">`);
+        res.setHeader('Content-Type', 'text/html');
+        res.send(htmlContent);
+        return;
+      }
+
+      const user = rows[0];
+      if (user.password !== password) {
+        const attemptsLeft = recordFailedAttempt(clientIp);
+        // generate error HTML directly
+        const clientData = btoa(`${growId}`);
+        const errorMessage = `Account credentials missmatched. You have ${attemptsLeft} attempt(s) left.`;
+        const templatePath = path.join(process.cwd(), 'template', 'dashboard.html');
+        const templateContent = fs.readFileSync(templatePath, 'utf-8');
+        const errorHtml = `<div class="text-danger text-danger-wrapper"><ul><li>${errorMessage}</li></ul></div>`;
+        let htmlContent = templateContent.replace('{{ data }}', Buffer.from(clientData).toString('base64'));
+        htmlContent = htmlContent.replace('<div class="row div-content-center">', `${errorHtml}<div class="row div-content-center">`);
+        res.setHeader('Content-Type', 'text/html');
+        res.send(htmlContent);
+        return;
+      }
+
+      resetAttempts(clientIp);
+
+      const token = Buffer.from(
+        `_token=${_token}&growId=${growId}&password=${password}&reg=0`,
+      ).toString('base64');
 
       res.send(
         JSON.stringify({

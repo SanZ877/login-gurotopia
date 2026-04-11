@@ -8,6 +8,9 @@
 # testing
 /coverage
 
+# typscript
+tsconfig.tsbuildinfo
+
 # next.js
 /.next/
 /out/
@@ -40,4 +43,4 @@ yarn-error.log*
 **/*.log
 package-lock.json
 **/*.bun
-.env*.local
+.env
